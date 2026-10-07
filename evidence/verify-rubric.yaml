@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 轮换开始时固定 secret-values.yaml、显式 secret-values 和 secret/ 文件清单、内容指纹及权限。
+  - id: 2
+    type: f2p
+    text: 全部输入必须先用旧 key 成功解密，再用新 key 重加密并逐个回读验证，任一失败不修改原文件。
+  - id: 3
+    type: f2p
+    text: 候选保持原路径、权限和换行风格，不把所有文件强制改成 0644 或统一内容格式。
+  - id: 4
+    type: f2p
+    text: 所有 secret 文件属于同一轮换代际，对外不会出现部分新 key、部分旧 key 的集合。
+  - id: 5
+    type: f2p
+    text: write、rename、fsync 或目录同步失败会恢复整套旧文件，而不是只回滚最后一个文件。
+  - id: 6
+    type: f2p
+    text: 原文件在准备期间被编辑时轮换明确失败并保留用户修改，不以旧快照覆盖。
+  - id: 7
+    type: p2p
+    text: 进程中止后下一次命令能恢复或清理候选与备份，任一可见文件集都能被单一密钥完整解开。
+  - id: 8
+    type: p2p
+    text: 当前 old/new encoder、普通单文件 secret 操作、缺失可选目录和命令行参数行为保持通过。
