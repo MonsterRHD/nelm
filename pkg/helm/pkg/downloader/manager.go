@@ -32,10 +32,8 @@ import (
 	"sync"
 
 	"github.com/Masterminds/semver/v3"
-	"sigs.k8s.io/yaml"
 
 	"github.com/werf/nelm/v2/pkg/helm/intern/resolver"
-	"github.com/werf/nelm/v2/pkg/helm/intern/third_party/dep/fs"
 	"github.com/werf/nelm/v2/pkg/helm/intern/urlutil"
 	chart "github.com/werf/nelm/v2/pkg/helm/pkg/chart/v2"
 	"github.com/werf/nelm/v2/pkg/helm/pkg/chart/v2/loader"
@@ -93,19 +91,51 @@ func (m *Manager) SetChartPath(path string) {
 //
 // If SkipUpdate is set, this will not update the repository.
 func (m *Manager) Build(ctx context.Context) error {
+	return m.withDependencyTxn(ctx, m.buildLocked)
+}
+
+// Update updates a local charts directory.
+//
+// It first reads the Chart.yaml file, and then attempts to
+// negotiate versions based on that. It will download the versions
+// from remote chart repositories unless SkipUpdate is true.
+func (m *Manager) Update(ctx context.Context) error {
+	return m.withDependencyLock(ctx, func(ctx context.Context, txn *dependencyTxn) error {
+		c, err := m.loadChartDir(ctx)
+		if err != nil {
+			return err
+		}
+		if c.Metadata.Dependencies == nil {
+			return nil
+		}
+		if err := txn.create(); err != nil {
+			return err
+		}
+		return m.finishDependencyTxn(txn, m.updateLocked(ctx, txn, c))
+	})
+}
+
+func (m *Manager) finishDependencyTxn(txn *dependencyTxn, runErr error) error {
+	if runErr != nil && !txn.keepWorkspace {
+		txn.cleanup()
+	}
+	if runErr == nil && !txn.keepWorkspace {
+		txn.cleanup()
+	}
+	return runErr
+}
+
+func (m *Manager) buildLocked(ctx context.Context, txn *dependencyTxn) error {
 	c, err := m.loadChartDir(ctx)
 	if err != nil {
 		return err
 	}
 
-	// If a lock file is found, run a build from that. Otherwise, just do
-	// an update.
 	lock := c.Lock
 	if lock == nil {
-		return m.Update(ctx)
+		return m.updateLocked(ctx, txn, c)
 	}
 
-	// Check that all of the repos we're dependent on actually exist.
 	req := c.Metadata.Dependencies
 
 	// If using apiVersion v1, calculate the hash before resolve repo names
@@ -143,95 +173,101 @@ func (m *Manager) Build(ctx context.Context) error {
 	}
 
 	if !m.AllowMissingRepos {
-		// Check that all of the repos we're dependent on actually exist.
 		if err := m.hasAllRepos(lock.Dependencies); err != nil {
 			return err
 		}
 	}
 
 	if !m.SkipUpdate {
-		// For each repo in the file, update the cached copy of that repo
 		if err := m.UpdateRepositories(ctx); err != nil {
 			return err
 		}
 	}
 
-	// Now we need to fetch every package here into charts/
-	return m.downloadAll(ctx, lock.Dependencies)
-}
-
-// Update updates a local charts directory.
-//
-// It first reads the Chart.yaml file, and then attempts to
-// negotiate versions based on that. It will download the versions
-// from remote chart repositories unless SkipUpdate is true.
-func (m *Manager) Update(ctx context.Context) error {
-	c, err := m.loadChartDir(ctx)
+	prepared, err := txn.prepareCandidate(ctx, lock.Dependencies)
 	if err != nil {
 		return err
 	}
 
-	// If no dependencies are found, we consider this a successful
-	// completion.
-	req := c.Metadata.Dependencies
-	if req == nil {
-		return nil
+	// The lock digest may be a Helm v2 hash for apiVersion v1 charts, while
+	// candidate verification always uses the v3 digest computed over the
+	// current (alias-resolved) requirements and the prepared dependencies.
+	preparedDigest, err := resolver.HashReq(req, prepared)
+	if err != nil {
+		return err
+	}
+	verifiedLock := &chart.Lock{
+		Generated:    lock.Generated,
+		Digest:       preparedDigest,
+		Dependencies: prepared,
+	}
+	if err := verifyGeneration(ctx, txn.candidateChartsDir(), t.mainChartsDir(), req, verifiedLock); err != nil {
+		return fmt.Errorf("candidate charts do not match %s: %w", dependencyLockFileName(c.Metadata.APIVersion), err)
 	}
 
-	// Get the names of the repositories the dependencies need that Helm is
-	// configured to know about.
+	return txn.commit(ctx, commitOptions{
+		publishLock: false,
+		lockName:    dependencyLockFileName(c.Metadata.APIVersion),
+		digest:      preparedDigest,
+		req:         req,
+		lock:        verifiedLock,
+	})
+}
+
+func (m *Manager) updateLocked(ctx context.Context, txn *dependencyTxn, c *chart.Chart) error {
+	req := c.Metadata.Dependencies
+
 	repoNames, err := m.resolveRepoNames(req)
 	if err != nil {
 		return err
 	}
 
-	// For the repositories Helm is not configured to know about, ensure Helm
-	// has some information about them and, when possible, the index files
-	// locally.
-	// TODO(mattfarina): Repositories should be explicitly added by end users
-	// rather than automatic. In Helm v4 require users to add repositories. They
-	// should have to add them in order to make sure they are aware of the
-	// repositories and opt-in to any locations, for security.
 	repoNames, err = m.ensureMissingRepos(repoNames, req)
 	if err != nil {
 		return err
 	}
 
-	// For each of the repositories Helm is configured to know about, update
-	// the index information locally.
 	if !m.SkipUpdate {
 		if err := m.UpdateRepositories(ctx); err != nil {
 			return err
 		}
 	}
 
-	// Now we need to find out which version of a chart best satisfies the
-	// dependencies in the Chart.yaml
 	lock, err := m.resolve(ctx, req, repoNames)
 	if err != nil {
 		return err
 	}
 
-	// Now we need to fetch every package here into charts/
-	if err := m.downloadAll(ctx, lock.Dependencies); err != nil {
+	prepared, err := txn.prepareCandidate(ctx, lock.Dependencies)
+	if err != nil {
 		return err
 	}
+	lock.Dependencies = prepared
 
-	// downloadAll might overwrite dependency version, recalculate lock digest
-	newDigest, err := resolver.HashReq(req, lock.Dependencies)
+	newDigest, err := resolver.HashReq(req, prepared)
 	if err != nil {
 		return err
 	}
 	lock.Digest = newDigest
 
-	// If the lock file hasn't changed, don't write a new one.
-	oldLock := c.Lock
-	if oldLock != nil && oldLock.Digest == lock.Digest {
-		return nil
+	if err := verifyGeneration(ctx, txn.candidateChartsDir(), t.mainChartsDir(), req, lock); err != nil {
+		return fmt.Errorf("candidate charts do not match resolved dependencies: %w", err)
 	}
 
-	// Finally, we need to write the lockfile.
-	return writeLock(m.ChartPath, lock, c.Metadata.APIVersion == chart.APIVersionV1)
+	publishLock := shouldPublishLock(c.Lock, newDigest)
+	if publishLock {
+		if err := txn.stageCandidateLock(lock); err != nil {
+			return err
+		}
+	}
+
+	return txn.commit(ctx, commitOptions{
+		publishLock: publishLock,
+		lockName:    dependencyLockFileName(c.Metadata.APIVersion),
+		digest:      newDigest,
+		req:         req,
+		lock:        lock,
+	})
 }
 
 func (m *Manager) loadChartDir(ctx context.Context) (*chart.Chart, error) {
@@ -251,145 +287,6 @@ func (m *Manager) resolve(ctx context.Context, req []*chart.Dependency, repoName
 	return res.Resolve(ctx, req, repoNames)
 }
 
-// downloadAll takes a list of dependencies and downloads them into charts/
-//
-// It will delete versions of the chart that exist on disk and might cause
-// a conflict.
-func (m *Manager) downloadAll(ctx context.Context, deps []*chart.Dependency) error {
-	repos, err := m.loadChartRepositories()
-	if err != nil {
-		return err
-	}
-
-	destPath := filepath.Join(m.ChartPath, "charts")
-	tmpPath := filepath.Join(m.ChartPath, fmt.Sprintf("tmpcharts-%d", os.Getpid()))
-
-	// Check if 'charts' directory is not actually a directory. If it does not exist, create it.
-	if fi, err := os.Stat(destPath); err == nil {
-		if !fi.IsDir() {
-			return fmt.Errorf("%q is not a directory", destPath)
-		}
-	} else if errors.Is(err, stdfs.ErrNotExist) {
-		if err := os.MkdirAll(destPath, 0755); err != nil {
-			return err
-		}
-	} else {
-		return fmt.Errorf("unable to retrieve file info for '%s': %v", destPath, err)
-	}
-
-	// Prepare tmpPath
-	if err := os.MkdirAll(tmpPath, 0755); err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpPath)
-
-	fmt.Fprintf(m.Out, "Saving %d charts\n", len(deps))
-	var saveError error
-	churls := make(map[string]struct{})
-	for _, dep := range deps {
-		// No repository means the chart is in charts directory
-		if dep.Repository == "" {
-			fmt.Fprintf(m.Out, "Dependency %s did not declare a repository. Assuming it exists in the charts directory\n", dep.Name)
-			// NOTE: we are only validating the local dependency conforms to the constraints. No copying to tmpPath is necessary.
-			chartPath := filepath.Join(destPath, dep.Name)
-			ch, err := loader.LoadDir(ctx, chartPath)
-			if err != nil {
-				return fmt.Errorf("unable to load chart '%s': %v", chartPath, err)
-			}
-
-			constraint, err := semver.NewConstraint(dep.Version)
-			if err != nil {
-				return fmt.Errorf("dependency %s has an invalid version/constraint format: %s", dep.Name, err)
-			}
-
-			v, err := semver.NewVersion(ch.Metadata.Version)
-			if err != nil {
-				return fmt.Errorf("invalid version %s for dependency %s: %s", dep.Version, dep.Name, err)
-			}
-
-			if !constraint.Check(v) {
-				saveError = fmt.Errorf("dependency %s at version %s does not satisfy the constraint %s", dep.Name, ch.Metadata.Version, dep.Version)
-				break
-			}
-			continue
-		}
-		if strings.HasPrefix(dep.Repository, "file://") {
-			if m.Debug {
-				fmt.Fprintf(m.Out, "Archiving %s from repo %s\n", dep.Name, dep.Repository)
-			}
-			ver, err := tarFromLocalDir(ctx, m.ChartPath, dep.Name, dep.Repository, dep.Version, tmpPath)
-			if err != nil {
-				saveError = err
-				break
-			}
-			dep.Version = ver
-			continue
-		}
-
-		// Any failure to resolve/download a chart should fail:
-		// https://github.com/helm/helm/issues/1439
-		churl, username, password, insecureSkipTLSVerify, passCredentialsAll, caFile, certFile, keyFile, err := m.findChartURL(dep.Name, dep.Version, dep.Repository, repos)
-		if err != nil {
-			saveError = fmt.Errorf("could not find %s: %w", churl, err)
-			break
-		}
-
-		if _, ok := churls[churl]; ok {
-			fmt.Fprintf(m.Out, "Already downloaded %s from repo %s\n", dep.Name, dep.Repository)
-			continue
-		}
-
-		fmt.Fprintf(m.Out, "Downloading %s from repo %s\n", dep.Name, dep.Repository)
-
-		dl := ChartDownloader{
-			Out:              m.Out,
-			Verify:           m.Verify,
-			Keyring:          m.Keyring,
-			RepositoryConfig: m.RepositoryConfig,
-			RepositoryCache:  m.RepositoryCache,
-			ContentCache:     m.ContentCache,
-			RegistryClient:   m.RegistryClient,
-			Getters:          m.Getters,
-			Options: []getter.Option{
-				getter.WithBasicAuth(username, password),
-				getter.WithPassCredentialsAll(passCredentialsAll),
-				getter.WithInsecureSkipVerifyTLS(insecureSkipTLSVerify),
-				getter.WithTLSClientConfig(certFile, keyFile, caFile),
-			},
-		}
-
-		version := ""
-		if registry.IsOCI(churl) {
-			churl, version, err = parseOCIRef(churl)
-			if err != nil {
-				return fmt.Errorf("could not parse OCI reference: %w", err)
-			}
-			dl.Options = append(dl.Options,
-				getter.WithRegistryClient(m.RegistryClient),
-				getter.WithTagName(version))
-		}
-
-		if _, _, err = dl.DownloadTo(churl, version, tmpPath); err != nil {
-			saveError = fmt.Errorf("could not download %s: %w", churl, err)
-			break
-		}
-
-		churls[churl] = struct{}{}
-	}
-
-	// TODO: this should probably be refactored to be a []error, so we can capture and provide more information rather than "last error wins".
-	if saveError == nil {
-		// now we can move all downloaded charts to destPath and delete outdated dependencies
-		if err := m.safeMoveDeps(ctx, deps, tmpPath, destPath); err != nil {
-			return err
-		}
-	} else {
-		fmt.Fprintln(m.Out, "Save error occurred: ", saveError)
-		return saveError
-	}
-	return nil
-}
-
 func parseOCIRef(chartRef string) (string, string, error) {
 	refTagRegexp := regexp.MustCompile(`^(oci://[^:]+(:[0-9]{1,5})?[^:]+):(.*)$`)
 	caps := refTagRegexp.FindStringSubmatch(chartRef)
@@ -400,79 +297,6 @@ func parseOCIRef(chartRef string) (string, string, error) {
 	tag := caps[3]
 
 	return chartRef, tag, nil
-}
-
-// safeMoveDeps moves all dependencies in the source and moves them into dest.
-//
-// It does this by first matching the file name to an expected pattern, then loading
-// the file to verify that it is a chart.
-//
-// Any charts in dest that do not exist in source are removed (barring local dependencies)
-//
-// Because it requires tar file introspection, it is more intensive than a basic move.
-//
-// This will only return errors that should stop processing entirely. Other errors
-// will emit log messages or be ignored.
-func (m *Manager) safeMoveDeps(ctx context.Context, deps []*chart.Dependency, source, dest string) error {
-	existsInSourceDirectory := map[string]bool{}
-	isLocalDependency := map[string]bool{}
-	sourceFiles, err := os.ReadDir(source)
-	if err != nil {
-		return err
-	}
-	// attempt to read destFiles; fail fast if we can't
-	destFiles, err := os.ReadDir(dest)
-	if err != nil {
-		return err
-	}
-
-	for _, dep := range deps {
-		if dep.Repository == "" {
-			isLocalDependency[dep.Name] = true
-		}
-	}
-
-	for _, file := range sourceFiles {
-		if file.IsDir() {
-			continue
-		}
-		filename := file.Name()
-		sourcefile := filepath.Join(source, filename)
-		destfile := filepath.Join(dest, filename)
-		existsInSourceDirectory[filename] = true
-		if _, err := loader.LoadFile(ctx, sourcefile); err != nil {
-			fmt.Fprintf(m.Out, "Could not verify %s for moving: %s (Skipping)", sourcefile, err)
-			continue
-		}
-		// NOTE: no need to delete the dest; os.Rename replaces it.
-		if err := fs.RenameWithFallback(sourcefile, destfile); err != nil {
-			fmt.Fprintf(m.Out, "Unable to move %s to charts dir %s (Skipping)", sourcefile, err)
-			continue
-		}
-	}
-
-	fmt.Fprintln(m.Out, "Deleting outdated charts")
-	// find all files that exist in dest that do not exist in source; delete them (outdated dependencies)
-	for _, file := range destFiles {
-		if !file.IsDir() && !existsInSourceDirectory[file.Name()] {
-			fname := filepath.Join(dest, file.Name())
-			ch, err := loader.LoadFile(ctx, fname)
-			if err != nil {
-				fmt.Fprintf(m.Out, "Could not verify %s for deletion: %s (Skipping)\n", fname, err)
-				continue
-			}
-			// local dependency - skip
-			if isLocalDependency[ch.Name()] {
-				continue
-			}
-			if err := os.Remove(fname); err != nil {
-				fmt.Fprintf(m.Out, "Could not delete %s: %s (Skipping)", fname, err)
-				continue
-			}
-		}
-	}
-
-	return nil
 }
 
 // hasAllRepos ensures that all of the referenced deps are in the local repo cache.
@@ -855,34 +679,6 @@ func (m *Manager) loadChartRepositories() (map[string]*repo.ChartRepository, err
 		indices[lname] = cr
 	}
 	return indices, nil
-}
-
-// writeLock writes a lockfile to disk
-func writeLock(chartpath string, lock *chart.Lock, legacyLockfile bool) error {
-	data, err := yaml.Marshal(lock)
-	if err != nil {
-		return err
-	}
-	lockfileName := "Chart.lock"
-	if legacyLockfile {
-		lockfileName = "requirements.lock"
-	}
-	dest := filepath.Join(chartpath, lockfileName)
-
-	info, err := os.Lstat(dest)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("error getting info for %q: %w", dest, err)
-	} else if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(dest)
-			if err != nil {
-				return fmt.Errorf("error reading symlink for %q: %w", dest, err)
-			}
-			return fmt.Errorf("the %s file is a symlink to %q", lockfileName, link)
-		}
-	}
-
-	return os.WriteFile(dest, data, 0644)
 }
 
 // archive a dep chart from local directory and save it into destPath

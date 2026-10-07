@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: repository、OCI、HTTP、file:// 与本地依赖在修改当前目录前形成隔离且可枚举的候选集合。
+  - id: 2
+    type: f2p
+    text: 每个候选 chart 的名称、版本约束和归档内容都通过验证，跳过错误文件不再被视为成功。
+  - id: 3
+    type: f2p
+    text: Chart.lock 的 digest 由最终候选内容计算，并能检测 lock 与 charts/ 不属于同一代际。
+  - id: 4
+    type: f2p
+    text: 候选目录、lock 文件及父目录同步完成后才一起成为当前依赖集合。
+  - id: 5
+    type: f2p
+    text: rename、delete、writeLock 或 fsync 任一失败会恢复上一完整 charts/ 与 lock。
+  - id: 6
+    type: f2p
+    text: 进程中止后后续命令能完成或清理 tmpcharts/备份，不会消费半集合。
+  - id: 7
+    type: p2p
+    text: 同一 chart 目录的并发 build/update 只能发布一个完整代际，旧任务不能覆盖新成功结果。
+  - id: 8
+    type: p2p
+    text: local dependency、symlink 防护、requirements.lock 和正常只读 dependency build 保持通过。

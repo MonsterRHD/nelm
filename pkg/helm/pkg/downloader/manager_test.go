@@ -24,10 +24,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
-	"sigs.k8s.io/yaml"
 
 	chart "github.com/werf/nelm/v2/pkg/helm/pkg/chart/v2"
 	"github.com/werf/nelm/v2/pkg/helm/pkg/chart/v2/loader"
@@ -229,13 +227,14 @@ func TestGetRepoNames(t *testing.T) {
 	}
 }
 
-func TestDownloadAll(t *testing.T) {
+func TestUpdateWithAtomicTransaction(t *testing.T) {
 	chartPath := t.TempDir()
 	m := &Manager{
 		Out:              new(bytes.Buffer),
 		RepositoryConfig: repoConfig,
-		RepositoryCache:  repoCache,
+		RepositoryCache:  tempRepoCache(t),
 		ChartPath:        chartPath,
+		SkipUpdate:       true,
 	}
 	signtest, err := loader.LoadDir(context.Background(), filepath.Join("testdata", "signtest"))
 	if err != nil {
@@ -268,12 +267,32 @@ func TestDownloadAll(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(chartPath, "tmpcharts"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.downloadAll(context.Background(), []*chart.Dependency{signDep, localDep}); err != nil {
+
+	c := &chart.Chart{Metadata: &chart.Metadata{
+		APIVersion:   chart.APIVersionV2,
+		Name:         "with-dependency",
+		Version:      "0.1.0",
+		Dependencies: []*chart.Dependency{signDep, localDep},
+	}}
+	if err := chartutil.SaveChartfile(filepath.Join(chartPath, "Chart.yaml"), c.Metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Update(context.Background()); err != nil {
 		t.Error(err)
 	}
 
 	if _, err := os.Stat(filepath.Join(chartPath, "charts", "signtest-0.1.0.tgz")); errors.Is(err, fs.ErrNotExist) {
 		t.Error(err)
+	}
+	if _, err := os.Stat(filepath.Join(chartPath, "Chart.lock")); errors.Is(err, fs.ErrNotExist) {
+		t.Error(err)
+	}
+	if _, err := os.Stat(filepath.Join(chartPath, "tmpcharts")); err != nil {
+		t.Errorf("user tmpcharts directory must be left untouched: %s", err)
+	}
+	if entries := listTmpWorkspaceEntries(t, chartPath); len(entries) != 0 {
+		t.Errorf("no transaction workspaces must remain: %v", entries)
 	}
 
 	// A chart with a bad name like this cannot be loaded and saved. Handling in
@@ -291,15 +310,27 @@ version: 0.1.0`
 		t.Fatal(err)
 	}
 
-	badLocalDep := &chart.Dependency{
+	badDep := &chart.Dependency{
 		Name:       "../bad-local-subchart",
 		Repository: "file://./testdata/bad-local-subchart",
 		Version:    "0.1.0",
 	}
+	badChart := &chart.Chart{Metadata: &chart.Metadata{
+		APIVersion:   chart.APIVersionV2,
+		Name:         "with-dependency",
+		Version:      "0.1.0",
+		Dependencies: []*chart.Dependency{badDep},
+	}}
+	if err := chartutil.SaveChartfile(filepath.Join(chartPath, "Chart.yaml"), badChart.Metadata); err != nil {
+		t.Fatal(err)
+	}
 
-	err = m.downloadAll(context.Background(), []*chart.Dependency{badLocalDep})
+	err = m.Update(context.Background())
 	if err == nil {
 		t.Fatal("Expected error for bad dependency name")
+	}
+	if _, err := os.Stat(filepath.Join(chartPath, "charts", "signtest-0.1.0.tgz")); err != nil {
+		t.Errorf("previous charts generation must remain in place after failure: %s", err)
 	}
 }
 
@@ -508,6 +539,10 @@ func checkBuildWithOptionalFields(t *testing.T, chartName string, dep chart.Depe
 	if err := m.Build(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+
+	if entries := listTmpWorkspaceEntries(t, dir(chartName)); len(entries) != 0 {
+		t.Fatalf("no transaction workspaces must remain: %v", entries)
+	}
 }
 
 func TestBuild_WithoutOptionalFields(t *testing.T) {
@@ -678,93 +713,42 @@ func TestDedupeRepos(t *testing.T) {
 	}
 }
 
-func TestWriteLock(t *testing.T) {
-	fixedTime, err := time.Parse(time.RFC3339, "2025-07-04T00:00:00Z")
-	assert.NoError(t, err)
-	lock := &chart.Lock{
-		Generated: fixedTime,
-		Digest:    "sha256:12345",
-		Dependencies: []*chart.Dependency{
-			{
-				Name:       "fantastic-chart",
-				Version:    "1.2.3",
-				Repository: "https://example.com/charts",
-			},
-		},
-	}
-	expectedContent, err := yaml.Marshal(lock)
-	assert.NoError(t, err)
-
-	t.Run("v2 lock file", func(t *testing.T) {
+func TestCheckLockFilePath(t *testing.T) {
+	t.Run("no lock file", func(t *testing.T) {
 		dir := t.TempDir()
-		err := writeLock(dir, lock, false)
-		assert.NoError(t, err)
-
-		lockfilePath := filepath.Join(dir, "Chart.lock")
-		_, err = os.Stat(lockfilePath)
-		assert.NoError(t, err, "Chart.lock should exist")
-
-		content, err := os.ReadFile(lockfilePath)
-		assert.NoError(t, err)
-		assert.Equal(t, expectedContent, content)
-
-		// Check that requirements.lock does not exist
-		_, err = os.Stat(filepath.Join(dir, "requirements.lock"))
-		assert.Error(t, err)
-		assert.True(t, os.IsNotExist(err))
+		assert.NoError(t, checkLockFilePath(filepath.Join(dir, "Chart.lock"), "Chart.lock"))
 	})
 
-	t.Run("v1 lock file", func(t *testing.T) {
-		dir := t.TempDir()
-		err := writeLock(dir, lock, true)
-		assert.NoError(t, err)
-
-		lockfilePath := filepath.Join(dir, "requirements.lock")
-		_, err = os.Stat(lockfilePath)
-		assert.NoError(t, err, "requirements.lock should exist")
-
-		content, err := os.ReadFile(lockfilePath)
-		assert.NoError(t, err)
-		assert.Equal(t, expectedContent, content)
-
-		// Check that Chart.lock does not exist
-		_, err = os.Stat(filepath.Join(dir, "Chart.lock"))
-		assert.Error(t, err)
-		assert.True(t, os.IsNotExist(err))
-	})
-
-	t.Run("overwrite existing lock file", func(t *testing.T) {
+	t.Run("regular lock file", func(t *testing.T) {
 		dir := t.TempDir()
 		lockfilePath := filepath.Join(dir, "Chart.lock")
-		assert.NoError(t, os.WriteFile(lockfilePath, []byte("old content"), 0644))
-
-		err = writeLock(dir, lock, false)
-		assert.NoError(t, err)
-
-		content, err := os.ReadFile(lockfilePath)
-		assert.NoError(t, err)
-		assert.Equal(t, expectedContent, content)
+		assert.NoError(t, os.WriteFile(lockfilePath, []byte("lock"), 0o644))
+		assert.NoError(t, checkLockFilePath(lockfilePath, "Chart.lock"))
 	})
 
-	t.Run("lock file is a symlink", func(t *testing.T) {
+	t.Run("v2 lock file is a symlink", func(t *testing.T) {
 		dir := t.TempDir()
 		dummyFile := filepath.Join(dir, "dummy.txt")
-		assert.NoError(t, os.WriteFile(dummyFile, []byte("dummy"), 0644))
+		assert.NoError(t, os.WriteFile(dummyFile, []byte("dummy"), 0o644))
 
 		lockfilePath := filepath.Join(dir, "Chart.lock")
 		assert.NoError(t, os.Symlink(dummyFile, lockfilePath))
 
-		err = writeLock(dir, lock, false)
+		err := checkLockFilePath(lockfilePath, "Chart.lock")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "the Chart.lock file is a symlink to")
 	})
 
-	t.Run("chart path is not a directory", func(t *testing.T) {
+	t.Run("v1 lock file is a symlink", func(t *testing.T) {
 		dir := t.TempDir()
-		filePath := filepath.Join(dir, "not-a-dir")
-		assert.NoError(t, os.WriteFile(filePath, []byte("file"), 0644))
+		dummyFile := filepath.Join(dir, "dummy.txt")
+		assert.NoError(t, os.WriteFile(dummyFile, []byte("dummy"), 0o644))
 
-		err = writeLock(filePath, lock, false)
+		lockfilePath := filepath.Join(dir, "requirements.lock")
+		assert.NoError(t, os.Symlink(dummyFile, lockfilePath))
+
+		err := checkLockFilePath(lockfilePath, "requirements.lock")
 		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "the requirements.lock file is a symlink to")
 	})
 }

@@ -16,9 +16,8 @@ limitations under the License.
 package cmd
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,6 +182,15 @@ func TestDependencyUpdateCmd_DoNotDeleteOldChartsOnError(t *testing.T) {
 	srv.Stop()
 	contentCache := t.TempDir()
 
+	lockBefore, err := os.ReadFile(filepath.Join(dir(chartname), "Chart.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chartsBefore, err := os.ReadDir(filepath.Join(dir(chartname), "charts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	_, output, err = executeActionCommand(fmt.Sprintf("dependency update %s --repository-config %s --repository-cache %s --content-cache %s --plain-http", dir(chartname), dir("repositories.yaml"), dir(), contentCache))
 	if err == nil {
 		t.Logf("Output: %s", output)
@@ -205,10 +213,25 @@ func TestDependencyUpdateCmd_DoNotDeleteOldChartsOnError(t *testing.T) {
 		}
 	}
 
-	// Make sure tmpcharts-x is deleted
-	tmpPath := filepath.Join(dir(chartname), fmt.Sprintf("tmpcharts-%d", os.Getpid()))
-	if _, err := os.Stat(tmpPath); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatal("tmpcharts dir still exists")
+	// Make sure the lock file is byte-identical after the failed update
+	lockAfter, err := os.ReadFile(filepath.Join(dir(chartname), "Chart.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(lockBefore, lockAfter) {
+		t.Fatal("Chart.lock changed during a failed dependency update")
+	}
+	if len(chartsBefore) != len(files) {
+		t.Fatal("charts directory changed during a failed dependency update")
+	}
+
+	// Make sure no dependency transaction workspace remains
+	matches, err := filepath.Glob(filepath.Join(dir(chartname), "tmpcharts-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary dependency workspaces still exist: %v", matches)
 	}
 }
 
