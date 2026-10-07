@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 明文与加密 artifact 都先写入同目录唯一候选，目标文件在候选确认前保持可读。
+  - id: 2
+    type: f2p
+    text: 完整性信息覆盖 APIVersion、release、timestamp、deploy type、加密标志和 DataRaw，篡改任一部分都会被拒绝。
+  - id: 3
+    type: f2p
+    text: 候选完成 gzip/JSON 编码、关闭和文件/目录同步后才原子替换目标。
+  - id: 4
+    type: f2p
+    text: 覆盖较长旧文件不会留下尾部，截断或尾随内容不会被当成合法 artifact。
+  - id: 5
+    type: f2p
+    text: 并发 writer 不会交叉写入，失败或较早 writer 不能覆盖或删除后来成功的完整代际。
+  - id: 6
+    type: f2p
+    text: 写入、rename、fsync 或进程中止后仍可读取上一有效制品，遗留候选可确定清理或完成。
+  - id: 7
+    type: p2p
+    text: ReadPlanArtifact、ReleasePlanShow 与 --use-plan 对截断、篡改、错误密钥和完整性错误给出一致拒绝。
+  - id: 8
+    type: p2p
+    text: 当前 scheme、过期检查、明文/加密选项和冻结计划直接执行语义保持通过。

@@ -1,0 +1,22 @@
+项目 project-04｜题目 计划制品写入中断后的完整代际发布
+固定基线 a486e730a193374c7b385b2c6716ed25eaa448a5｜有效轮数 68｜syncRevision 16
+Prompt-Rubric 对齐：逐项回指冻结 Prompt 的场景、目标、失败边界或兼容边界；未增加接口、错误码、部署或性能验收。
+验证摘要：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：1｜状态：通过｜期望行为：明文与加密 artifact 都先写入同目录唯一候选，目标文件在候选确认前保持可读。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：2｜状态：通过｜期望行为：完整性信息覆盖 APIVersion、release、timestamp、deploy type、加密标志和 DataRaw，篡改任一部分都会被拒绝。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：3｜状态：未通过｜期望行为：候选完成 gzip/JSON 编码、关闭和文件/目录同步后才原子替换目标。｜实际观察：候选 rename 后目录同步失败只告警｜直接证据：候选 rename 后目录同步失败只告警｜原因：候选 rename 后目录同步失败只告警｜影响：该 Rubric 的失败路径或原子可见性保证未成立｜证据位置：固定版本工作区代码与验证摘要
+Rubric ID：4｜状态：通过｜期望行为：覆盖较长旧文件不会留下尾部，截断或尾随内容不会被当成合法 artifact。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：5｜状态：通过｜期望行为：并发 writer 不会交叉写入，失败或较早 writer 不能覆盖或删除后来成功的完整代际。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：6｜状态：未通过｜期望行为：写入、rename、fsync 或进程中止后仍可读取上一有效制品，遗留候选可确定清理或完成。｜实际观察：目录同步失败后仍返回成功｜直接证据：目录同步失败后仍返回成功｜原因：目录同步失败后仍返回成功｜影响：该 Rubric 的失败路径或原子可见性保证未成立｜证据位置：固定版本工作区代码与验证摘要
+Rubric ID：7｜状态：通过｜期望行为：ReadPlanArtifact、ReleasePlanShow 与 --use-plan 对截断、篡改、错误密钥和完整性错误给出一致拒绝。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+Rubric ID：8｜状态：通过｜期望行为：当前 scheme、过期检查、明文/加密选项和冻结计划直接执行语义保持通过。｜实际观察：生产调用图和失败恢复边界满足该要求｜直接证据：go test -count=1 ./...；plan_artifact 定向测试与 fsync 错误路径由代码审计确认
+逐条结果：
+1 通过
+2 通过
+3 未通过 候选 rename 后目录同步失败只告警
+4 通过
+5 通过
+6 未通过 目录同步失败后仍返回成功
+7 通过
+8 通过
+完成度：部分完成
